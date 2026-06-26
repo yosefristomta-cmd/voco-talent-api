@@ -7,7 +7,7 @@ const PDL_API_KEY = process.env.PDL_API_KEY;
 async function analyzeJobAd(jobAd) {
   const prompt = `Du är en rekryterings-AI. Läs jobbannonsen nedan och returnera ENBART giltig JSON med exakt dessa fält:
 {"title": string, "seniority": string, "industry": string, "location": string, "country": string, "yearsExperience": number, "education": string, "leadership": string, "skills": string[], "technologies": string[], "languages": string[], "certifications": string[], "similarTitles": string[], "keywords": string[]}
-Svara på svenska för label-fält men använd engelska för skills/technologies/keywords så PDL kan söka på dem. Annons:
+VIKTIGT: country MÅSTE vara på engelska (sweden, norway, germany, etc). Svara på svenska för andra fält men använd engelska för skills/technologies/keywords/country så PDL kan söka på dem. Annons:
 """${jobAd.slice(0, 4000)}"""`;
 
   const response = await anthropic.messages.create({
@@ -23,17 +23,22 @@ Svara på svenska för label-fält men använd engelska för skills/technologies
 }
 
 async function searchCandidates(analysis) {
-  const titleTerms = [analysis.title, ...(analysis.similarTitles || [])].filter(Boolean).slice(0, 4);
-  const location = analysis.location || "Stockholm";
-  const country = analysis.country || "sweden";
+  var titleTerms = [analysis.title].concat(analysis.similarTitles || []).filter(Boolean).slice(0, 4);
+  var location = analysis.location || "Stockholm";
 
-  const titleConditions = titleTerms.map(t => `job_title='${t.replace(/'/g, "")}'`).join(" OR ");
-  const sqlQuery = `SELECT * FROM person WHERE (${titleConditions || "job_title='manager'"}) AND location_country='${country.replace(/'/g, "")}'`;
+  var country = (analysis.country || "sweden").toLowerCase();
+  if (country === "sverige") country = "sweden";
+  if (country === "tyskland") country = "germany";
+  if (country === "norge") country = "norway";
+  if (country === "danmark") country = "denmark";
+
+  var titleConditions = titleTerms.map(function(t) { return "job_title='" + t.replace(/'/g, "") + "'"; }).join(" OR ");
+  var sqlQuery = "SELECT * FROM person WHERE (" + (titleConditions || "job_title='manager'") + ") AND location_country='" + country + "'";
 
   console.log("PDL SQL query:", sqlQuery);
 
   try {
-    const response = await axios.post(
+    var response = await axios.post(
       "https://api.peopledatalabs.com/v5/person/search",
       {
         sql: sqlQuery,
@@ -49,7 +54,7 @@ async function searchCandidates(analysis) {
       }
     );
 
-    const rawCandidates = response.data.data || [];
+    var rawCandidates = response.data.data || [];
     console.log("PDL returned " + rawCandidates.length + " candidates");
 
     if (rawCandidates.length === 0) {
@@ -57,7 +62,7 @@ async function searchCandidates(analysis) {
       return await broaderSearch(analysis, country);
     }
 
-    const scored = rawCandidates
+    var scored = rawCandidates
       .map(function(person) { return scorePerson(person, analysis); })
       .filter(function(c) { return c !== null; })
       .sort(function(a, b) { return (b.matchScore + b.oppScore * 0.35) - (a.matchScore + a.oppScore * 0.35); })
@@ -77,16 +82,12 @@ async function searchCandidates(analysis) {
 }
 
 async function broaderSearch(analysis, country) {
-  const keywords = (analysis.skills || []).slice(0, 2).map(function(s) { return s.replace(/'/g, ""); });
-  let sqlQuery = "SELECT * FROM person WHERE location_country='" + country + "'";
-  if (keywords.length > 0) {
-    sqlQuery += " AND (job_title LIKE '%" + keywords[0] + "%')";
-  }
+  var sqlQuery = "SELECT * FROM person WHERE location_country='" + country + "' AND job_title IS NOT NULL";
 
   console.log("Broader PDL SQL query:", sqlQuery);
 
   try {
-    const response = await axios.post(
+    var response = await axios.post(
       "https://api.peopledatalabs.com/v5/person/search",
       {
         sql: sqlQuery,
@@ -102,7 +103,7 @@ async function broaderSearch(analysis, country) {
       }
     );
 
-    const rawCandidates = response.data.data || [];
+    var rawCandidates = response.data.data || [];
     console.log("Broader search returned " + rawCandidates.length + " candidates");
 
     var scored = rawCandidates
