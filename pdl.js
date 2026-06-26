@@ -55,7 +55,7 @@ async function searchCandidates(analysis) {
         query,
         size: 25,
         pretty: true,
-        dataset: "resume,contact,demographic,social",
+        dataset: "all",
       },
       {
         headers: {
