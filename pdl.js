@@ -23,36 +23,20 @@ Svara på svenska för label-fält men använd engelska för skills/technologies
 }
 
 async function searchCandidates(analysis) {
-  const mustClauses = [];
+  const titleTerms = [analysis.title, ...(analysis.similarTitles || [])].filter(Boolean).slice(0, 4);
+  const location = analysis.location || "Stockholm";
+  const country = analysis.country || "sweden";
 
-  if (analysis.location) {
-    mustClauses.push({
-      term: { "location_country": analysis.country || "sweden" }
-    });
-  }
+  const titleConditions = titleTerms.map(t => `job_title='${t.replace(/'/g, "")}'`).join(" OR ");
+  const sqlQuery = `SELECT * FROM person WHERE (${titleConditions || "job_title='manager'"}) AND location_country='${country.replace(/'/g, "")}'`;
 
-  const titleTerms = [analysis.title, ...(analysis.similarTitles || [])].filter(Boolean).slice(0, 3);
-  if (titleTerms.length > 0) {
-    mustClauses.push({
-      bool: {
-        should: titleTerms.map(t => ({
-          match: { "job_title": t }
-        }))
-      }
-    });
-  }
-
-  const query = {
-    bool: {
-      must: mustClauses.length > 0 ? mustClauses : [{ match_all: {} }]
-    }
-  };
+  console.log("PDL SQL query:", sqlQuery);
 
   try {
     const response = await axios.post(
       "https://api.peopledatalabs.com/v5/person/search",
       {
-        query,
+        sql: sqlQuery,
         size: 25,
         pretty: true,
         dataset: "all",
@@ -66,75 +50,119 @@ async function searchCandidates(analysis) {
     );
 
     const rawCandidates = response.data.data || [];
-    console.log(`PDL returned ${rawCandidates.length} candidates`);
+    console.log("PDL returned " + rawCandidates.length + " candidates");
+
+    if (rawCandidates.length === 0) {
+      console.log("No candidates found, trying broader search...");
+      return await broaderSearch(analysis, country);
+    }
 
     const scored = rawCandidates
-      .map(person => scorePerson(person, analysis))
-      .filter(c => c !== null)
-      .sort((a, b) => (b.matchScore + b.oppScore * 0.35) - (a.matchScore + a.oppScore * 0.35))
+      .map(function(person) { return scorePerson(person, analysis); })
+      .filter(function(c) { return c !== null; })
+      .sort(function(a, b) { return (b.matchScore + b.oppScore * 0.35) - (a.matchScore + a.oppScore * 0.35); })
       .slice(0, 20);
 
     return scored;
   } catch (error) {
-    console.error("PDL API error:", error.response?.data || error.message);
-    throw new Error("Kunde inte hämta kandidater från People Data Labs: " + (error.response?.data?.error?.message || error.message));
+    console.error("PDL API error:", error.response ? error.response.data : error.message);
+
+    if (error.response && error.response.status === 404) {
+      console.log("No results, trying broader search...");
+      return await broaderSearch(analysis, country);
+    }
+
+    throw new Error("Kunde inte hämta kandidater från People Data Labs: " + (error.response ? (error.response.data.error ? error.response.data.error.message : error.message) : error.message));
+  }
+}
+
+async function broaderSearch(analysis, country) {
+  const keywords = (analysis.skills || []).slice(0, 2).map(function(s) { return s.replace(/'/g, ""); });
+  let sqlQuery = "SELECT * FROM person WHERE location_country='" + country + "'";
+  if (keywords.length > 0) {
+    sqlQuery += " AND (job_title LIKE '%" + keywords[0] + "%')";
+  }
+
+  console.log("Broader PDL SQL query:", sqlQuery);
+
+  try {
+    const response = await axios.post(
+      "https://api.peopledatalabs.com/v5/person/search",
+      {
+        sql: sqlQuery,
+        size: 25,
+        pretty: true,
+        dataset: "all",
+      },
+      {
+        headers: {
+          "X-Api-Key": PDL_API_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const rawCandidates = response.data.data || [];
+    console.log("Broader search returned " + rawCandidates.length + " candidates");
+
+    var scored = rawCandidates
+      .map(function(person) { return scorePerson(person, analysis); })
+      .filter(function(c) { return c !== null; })
+      .sort(function(a, b) { return (b.matchScore + b.oppScore * 0.35) - (a.matchScore + a.oppScore * 0.35); })
+      .slice(0, 20);
+
+    return scored;
+  } catch (error) {
+    console.error("Broader search also failed:", error.response ? error.response.data : error.message);
+    return [];
   }
 }
 
 function scorePerson(person, analysis) {
   try {
-    const personSkills = (person.skills || []).map(s => s.name?.toLowerCase() || "");
-    const personTitle = (person.job_title || "").toLowerCase();
-    const personLocation = (person.location_name || "").toLowerCase();
-    const personExperience = person.inferred_years_experience || 0;
-    const personCompany = person.job_company_name || "";
-    const currentJob = person.experience?.[0];
-    const tenureYears = currentJob ? calculateTenure(currentJob.start_date) : 0;
+    var personSkills = (person.skills || []).map(function(s) { return (typeof s === "string" ? s : (s.name || "")).toLowerCase(); });
+    var personTitle = (person.job_title || "").toLowerCase();
+    var personLocation = (person.location_name || "").toLowerCase();
+    var personExperience = person.inferred_years_experience || 0;
+    var personCompany = person.job_company_name || "";
+    var currentJob = person.experience ? person.experience[0] : null;
+    var tenureYears = currentJob ? calculateTenure(currentJob.start_date) : 0;
 
-    const requiredSkills = [
-      ...(analysis.skills || []),
-      ...(analysis.technologies || [])
-    ].map(s => s.toLowerCase());
+    var requiredSkills = (analysis.skills || []).concat(analysis.technologies || []).map(function(s) { return s.toLowerCase(); });
 
-    const matchedSkills = requiredSkills.filter(skill =>
-      personSkills.some(ps => ps.includes(skill) || skill.includes(ps))
-    );
-    const skillScore = requiredSkills.length > 0
-      ? matchedSkills.length / requiredSkills.length
-      : 0.5;
+    var matchedSkills = requiredSkills.filter(function(skill) {
+      return personSkills.some(function(ps) { return ps.includes(skill) || skill.includes(ps); });
+    });
+    var skillScore = requiredSkills.length > 0 ? matchedSkills.length / requiredSkills.length : 0.5;
 
-    const wantedYears = analysis.yearsExperience || 5;
-    const expScore = Math.min(personExperience / wantedYears, 1);
+    var wantedYears = analysis.yearsExperience || 5;
+    var expScore = Math.min(personExperience / wantedYears, 1);
 
-    const wantedLocation = (analysis.location || "").toLowerCase();
-    const locScore = personLocation.includes(wantedLocation) ||
-      wantedLocation.includes(personLocation.split(",")[0]) ? 1 : 0.5;
+    var wantedLocation = (analysis.location || "").toLowerCase();
+    var locScore = personLocation.includes(wantedLocation) || wantedLocation.includes(personLocation.split(",")[0]) ? 1 : 0.5;
 
-    const titleTerms = [analysis.title, ...(analysis.similarTitles || [])]
-      .map(t => t.toLowerCase());
-    const titleScore = titleTerms.some(t =>
-      personTitle.includes(t.split(" ")[0]) || t.includes(personTitle.split(" ")[0])
-    ) ? 1 : 0.4;
+    var titleTerms = [analysis.title].concat(analysis.similarTitles || []).map(function(t) { return t.toLowerCase(); });
+    var titleScore = titleTerms.some(function(t) {
+      return personTitle.includes(t.split(" ")[0]) || t.includes(personTitle.split(" ")[0]);
+    }) ? 1 : 0.4;
 
-    const rawMatch = (skillScore * 0.40) + (expScore * 0.20) + (locScore * 0.20) + (titleScore * 0.20);
-    const matchScore = Math.round(Math.min(Math.max(rawMatch * 100, 40), 98));
+    var rawMatch = (skillScore * 0.40) + (expScore * 0.20) + (locScore * 0.20) + (titleScore * 0.20);
+    var matchScore = Math.round(Math.min(Math.max(rawMatch * 100, 40), 98));
 
-    const tenureFit = tenureYears >= 2 && tenureYears <= 4 ? 1
-      : tenureYears < 2 ? tenureYears / 2
-      : Math.max(0.2, 1 - (tenureYears - 4) / 6);
-    const oppScore = Math.round(Math.min(Math.max(
-      (tenureFit * 0.50 + skillScore * 0.30 + expScore * 0.20) * 100, 35
-    ), 97));
+    var tenureFit = tenureYears >= 2 && tenureYears <= 4 ? 1 : tenureYears < 2 ? tenureYears / 2 : Math.max(0.2, 1 - (tenureYears - 4) / 6);
+    var oppScore = Math.round(Math.min(Math.max((tenureFit * 0.50 + skillScore * 0.30 + expScore * 0.20) * 100, 35), 97));
 
-    const reason = buildReason(person, analysis, matchedSkills, personExperience, tenureYears);
+    var reason = buildReason(person, analysis, matchedSkills, personExperience, tenureYears);
 
-    const history = (person.experience || []).slice(0, 4).map(exp => ({
-      company: exp.company?.name || exp.company || "Okänt företag",
-      title: exp.title?.name || exp.title || "Okänd roll",
-      from: exp.start_date?.slice(0, 4) || "?",
-      to: exp.end_date?.slice(0, 4) || null,
-      current: !exp.end_date,
-    }));
+    var history = (person.experience || []).slice(0, 4).map(function(exp) {
+      return {
+        company: (exp.company ? (exp.company.name || exp.company) : null) || "Okänt företag",
+        title: (exp.title ? (exp.title.name || exp.title) : null) || "Okänd roll",
+        from: exp.start_date ? exp.start_date.slice(0, 4) : "?",
+        to: exp.end_date ? exp.end_date.slice(0, 4) : null,
+        current: !exp.end_date,
+      };
+    });
 
     return {
       id: person.id || Math.random().toString(36).slice(2),
@@ -144,15 +172,15 @@ function scorePerson(person, analysis) {
       city: person.location_locality || person.location_name || "Okänd ort",
       years: personExperience,
       tenure: tenureYears,
-      skills: personSkills.slice(0, 8).map(s => capitalize(s)),
+      skills: personSkills.slice(0, 8).map(function(s) { return capitalize(s); }),
       education: formatEducation(person.education),
-      matchScore,
-      oppScore,
-      matchedSkills: matchedSkills.map(s => capitalize(s)),
+      matchScore: matchScore,
+      oppScore: oppScore,
+      matchedSkills: matchedSkills.map(function(s) { return capitalize(s); }),
       linkedin: person.linkedin_url || null,
-      reason,
-      history,
-      languages: person.languages?.map(l => capitalize(l.name || l)) || ["Svenska", "Engelska"],
+      reason: reason,
+      history: history,
+      languages: person.languages ? person.languages.map(function(l) { return capitalize(l.name || l); }) : ["Svenska", "Engelska"],
       strengths: buildStrengths(person, analysis, matchedSkills, personExperience),
       weaknesses: buildWeaknesses(person, analysis, matchedSkills, personLocation),
     };
@@ -164,17 +192,17 @@ function scorePerson(person, analysis) {
 
 function calculateTenure(startDate) {
   if (!startDate) return 0;
-  const start = new Date(startDate);
-  const now = new Date();
+  var start = new Date(startDate);
+  var now = new Date();
   return Math.max(0, (now - start) / (1000 * 60 * 60 * 24 * 365));
 }
 
 function formatEducation(educationArray) {
   if (!educationArray || educationArray.length === 0) return "Ej angiven";
-  const edu = educationArray[0];
-  const degree = edu.degrees?.[0] || edu.degree || "";
-  const school = edu.school?.name || edu.school || "";
-  if (degree && school) return `${degree}, ${school}`;
+  var edu = educationArray[0];
+  var degree = (edu.degrees ? edu.degrees[0] : null) || edu.degree || "";
+  var school = (edu.school ? (edu.school.name || edu.school) : null) || "";
+  if (degree && school) return degree + ", " + school;
   return school || degree || "Ej angiven";
 }
 
@@ -184,32 +212,34 @@ function capitalize(str) {
 }
 
 function buildReason(person, analysis, matchedSkills, years, tenure) {
-  const parts = [];
-  if (years > 0) parts.push(`${years} års erfarenhet inom ${analysis.industry || "branschen"}`);
-  if (matchedSkills.length > 0) parts.push(`matchar ${matchedSkills.length} efterfrågade kompetenser (${matchedSkills.slice(0, 3).join(", ")})`);
-  if (tenure >= 2 && tenure <= 4) parts.push(`befinner sig i bytesfönstret (${tenure.toFixed(1)} år på nuvarande arbetsgivare)`);
-  if (person.job_company_name) parts.push(`arbetar för närvarande på ${person.job_company_name}`);
+  var parts = [];
+  if (years > 0) parts.push(years + " års erfarenhet inom " + (analysis.industry || "branschen"));
+  if (matchedSkills.length > 0) parts.push("matchar " + matchedSkills.length + " efterfrågade kompetenser (" + matchedSkills.slice(0, 3).join(", ") + ")");
+  if (tenure >= 2 && tenure <= 4) parts.push("befinner sig i bytesfönstret (" + tenure.toFixed(1) + " år på nuvarande arbetsgivare)");
+  if (person.job_company_name) parts.push("arbetar för närvarande på " + person.job_company_name);
   return parts.length > 0 ? parts.join(", ") + "." : "Kandidaten matchar kravprofilen.";
 }
 
 function buildStrengths(person, analysis, matchedSkills, years) {
-  const s = [];
-  if (matchedSkills.length >= 3) s.push(`Stark kompetensmatchning – täcker ${matchedSkills.slice(0, 4).join(", ")}.`);
-  if (years >= (analysis.yearsExperience || 5)) s.push(`Gedigen erfarenhet (${years} år), uppfyller kravet.`);
+  var s = [];
+  if (matchedSkills.length >= 3) s.push("Stark kompetensmatchning – täcker " + matchedSkills.slice(0, 4).join(", ") + ".");
+  if (years >= (analysis.yearsExperience || 5)) s.push("Gedigen erfarenhet (" + years + " år), uppfyller kravet.");
   if (person.linkedin_url) s.push("Verifierbar LinkedIn-profil tillgänglig.");
   if (s.length === 0) s.push("Profilen matchar grundkraven för rollen.");
   return s.slice(0, 3);
 }
 
 function buildWeaknesses(person, analysis, matchedSkills, personLocation) {
-  const w = [];
-  const wantedLocation = (analysis.location || "").toLowerCase();
+  var w = [];
+  var wantedLocation = (analysis.location || "").toLowerCase();
   if (personLocation && !personLocation.includes(wantedLocation) && wantedLocation) {
-    w.push(`Bor i ${person.location_locality || personLocation} – kan kräva pendling till ${analysis.location}.`);
+    w.push("Bor i " + (person.location_locality || personLocation) + " – kan kräva pendling till " + analysis.location + ".");
   }
-  const allRequired = [...(analysis.skills || []), ...(analysis.technologies || [])];
-  const missing = allRequired.filter(s => !matchedSkills.map(m => m.toLowerCase()).includes(s.toLowerCase())).slice(0, 2);
-  if (missing.length > 0) w.push(`Kompetens inom ${missing.join(" och ")} framgår inte tydligt av profilen.`);
+  var allRequired = (analysis.skills || []).concat(analysis.technologies || []);
+  var missing = allRequired.filter(function(s) {
+    return !matchedSkills.map(function(m) { return m.toLowerCase(); }).includes(s.toLowerCase());
+  }).slice(0, 2);
+  if (missing.length > 0) w.push("Kompetens inom " + missing.join(" och ") + " framgår inte tydligt av profilen.");
   if (w.length === 0) w.push("Inga väsentliga svagheter identifierade mot kravprofilen.");
   return w.slice(0, 3);
 }
